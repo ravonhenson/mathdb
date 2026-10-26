@@ -32,7 +32,7 @@ def cmd_eval(args):
     device = pick_device()
     model, tokenizer, _ = load_checkpoint(args.ckpt, device)
     dataset = InkDataset([args.split], tokenizer, max_points=10**9, limit=args.limit)
-    cer, exact, examples = evaluate(model, make_loader(dataset, 64, shuffle=False), tokenizer, device, show=10)
+    cer, exact, examples = evaluate(model, make_loader(dataset, 64, shuffle=False, device=device), tokenizer, device, show=10)
     print(f"{args.split}: {len(dataset):,} inks  CER {cer:.3f}  exact match {exact:.1%}")
     for sid, target, pred in examples:
         print(f"  {sid}\n    target: {target}\n    pred:   {pred}")
@@ -64,7 +64,7 @@ def main():
 
     p = sub.add_parser("train", help="train the CTC model")
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=3)

@@ -1,6 +1,7 @@
 """Training loop, evaluation, and checkpoint helpers."""
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 
@@ -17,13 +18,29 @@ def pick_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")  # Apple Silicon GPU
     if torch.cuda.is_available():
+        # TF32 matmuls are a free win on Ampere/Ada GPUs. NOT cudnn.benchmark:
+        # the length-bucketed sampler feeds it a continuously varying range of
+        # shapes, so it keeps re-autotuning and caching new workspaces instead
+        # of converging, and reserved memory grows until CUDA OOMs mid-run.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-def make_loader(dataset, batch_size, shuffle):
+def autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def make_loader(dataset, batch_size, shuffle, device):
     sampler = LengthBucketSampler(dataset.lengths(), batch_size, shuffle=shuffle)
-    return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate, num_workers=0)
+    # Overlap host-side batch prep with GPU compute; pointless on CPU/MPS.
+    on_gpu = device.type == "cuda"
+    return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate,
+                       num_workers=4 if on_gpu else 0, pin_memory=on_gpu,
+                       persistent_workers=on_gpu)
 
 
 def edit_distance(a, b) -> int:
@@ -44,7 +61,9 @@ def evaluate(model, loader, tokenizer, device, show: int = 5):
     errors = total = exact = count = 0
     examples = []
     for x, x_lens, y, y_lens, ids in loader:
-        log_probs, out_lens = model(x.to(device), x_lens.to(device))
+        x, x_lens = x.to(device, non_blocking=True), x_lens.to(device, non_blocking=True)
+        with autocast(device):
+            log_probs, out_lens = model(x, x_lens)
         preds = greedy_decode(log_probs, out_lens, tokenizer.blank_id)
         targets = torch.split(y, y_lens.tolist())
         for pred, target, sid in zip(preds, targets, ids):
@@ -84,8 +103,8 @@ def train(args):
 
     train_set = InkDataset(splits, tokenizer, max_points=args.max_points, limit=args.limit)
     valid_set = InkDataset(["valid"], tokenizer, max_points=args.max_points, limit=args.valid_limit)
-    train_loader = make_loader(train_set, args.batch_size, shuffle=True)
-    valid_loader = make_loader(valid_set, args.batch_size, shuffle=False)
+    train_loader = make_loader(train_set, args.batch_size, shuffle=True, device=device)
+    valid_loader = make_loader(valid_set, args.batch_size, shuffle=False, device=device)
     print(f"[train] {len(train_set):,} train inks, {len(valid_set):,} valid inks")
 
     model = CTCModel(len(tokenizer), hidden=args.hidden, layers=args.layers).to(device)
@@ -103,10 +122,16 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         start, running = time.time(), 0.0
         for x, x_lens, y, y_lens, _ in train_loader:
-            log_probs, out_lens = model(x.to(device), x_lens.to(device))
-            # CTC loss isn't implemented on MPS, so compute it on CPU.
-            # Gradients still flow back to the GPU tensors.
-            loss = ctc(log_probs.transpose(0, 1).float().cpu(), y, out_lens.cpu(), y_lens)
+            x, x_lens = x.to(device, non_blocking=True), x_lens.to(device, non_blocking=True)
+            with autocast(device):
+                log_probs, out_lens = model(x, x_lens)
+            log_probs = log_probs.transpose(0, 1).float()
+            if device.type == "mps":
+                # CTC loss isn't implemented on MPS, so compute it on CPU.
+                # Gradients still flow back to the GPU tensors.
+                loss = ctc(log_probs.cpu(), y, out_lens.cpu(), y_lens)
+            else:
+                loss = ctc(log_probs, y.to(device, non_blocking=True), out_lens.cpu(), y_lens)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
