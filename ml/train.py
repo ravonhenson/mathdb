@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import time
 
 import torch
@@ -15,8 +16,15 @@ from tokenizer import Tokenizer
 
 
 def pick_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")  # Apple Silicon GPU
+    """CUDA if available, else CPU. Set ML_DEVICE=cpu|cuda|mps to override.
+
+    Apple's MPS is opt-in only: its LSTM caches a compiled graph for every new
+    batch shape and never frees it, so length-bucketed batches use up 16 GB
+    of memory within ~40 batches. The CPU handles this small model fine.
+    """
+    choice = os.environ.get("ML_DEVICE")
+    if choice:
+        return torch.device(choice)
     if torch.cuda.is_available():
         # TF32 matmuls are a free win on Ampere/Ada GPUs. NOT cudnn.benchmark:
         # the length-bucketed sampler feeds it a continuously varying range of
@@ -32,6 +40,14 @@ def autocast(device: torch.device):
     if device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
+
+
+def to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # non_blocking is only safe on CUDA, where the loader pins memory and PyTorch
+    # keeps the source alive until the copy finishes. On MPS the CPU tensor can be
+    # freed mid-copy (e.g. `x = x.to(dev, non_blocking=True)`), feeding the model
+    # garbage: valid CER went from 8.7% to 97% on the Mac.
+    return t.to(device, non_blocking=device.type == "cuda")
 
 
 def make_loader(dataset, batch_size, shuffle, device):
@@ -61,7 +77,7 @@ def evaluate(model, loader, tokenizer, device, show: int = 5):
     errors = total = exact = count = 0
     examples = []
     for x, x_lens, y, y_lens, ids in loader:
-        x, x_lens = x.to(device, non_blocking=True), x_lens.to(device, non_blocking=True)
+        x, x_lens = to_device(x, device), to_device(x_lens, device)
         with autocast(device):
             log_probs, out_lens = model(x, x_lens)
         preds = greedy_decode(log_probs, out_lens, tokenizer.blank_id)
@@ -122,7 +138,7 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         start, running = time.time(), 0.0
         for x, x_lens, y, y_lens, _ in train_loader:
-            x, x_lens = x.to(device, non_blocking=True), x_lens.to(device, non_blocking=True)
+            x, x_lens = to_device(x, device), to_device(x_lens, device)
             with autocast(device):
                 log_probs, out_lens = model(x, x_lens)
             log_probs = log_probs.transpose(0, 1).float()
@@ -131,7 +147,7 @@ def train(args):
                 # Gradients still flow back to the GPU tensors.
                 loss = ctc(log_probs.cpu(), y, out_lens.cpu(), y_lens)
             else:
-                loss = ctc(log_probs, y.to(device, non_blocking=True), out_lens.cpu(), y_lens)
+                loss = ctc(log_probs, to_device(y, device), out_lens.cpu(), y_lens)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -149,7 +165,10 @@ def train(args):
         for sid, target, pred in examples:
             print(f"    {sid}\n      target: {target}\n      pred:   {pred}")
 
-        extra = {"epoch": epoch, "valid_cer": cer, "args": vars(args)}
+        # Drop `func` (the argparse handler): a function in the checkpoint makes
+        # torch.load (weights_only=True, the default since PyTorch 2.6) refuse the file.
+        run_args = {k: v for k, v in vars(args).items() if k != "func"}
+        extra = {"epoch": epoch, "valid_cer": cer, "args": run_args}
         save_checkpoint(CHECKPOINT_DIR / "last.pt", model, tokenizer, extra)
         if cer < best_cer:
             best_cer = cer
