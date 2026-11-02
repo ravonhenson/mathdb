@@ -16,11 +16,6 @@
 			path = MyApp;
 			sourceTree = "<group>";
 		};
-		12B53BF5308EE11F005E197E /* ml */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = ml;
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -35,7 +30,6 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				12B53BF5308EE11F005E197E /* ml */,
 				000000000000000000000010 /* MyApp */,
 				000000000000000000000020 /* Products */,
 			);
@@ -64,7 +58,6 @@
 			);
 			fileSystemSynchronizedGroups = (
 				000000000000000000000010 /* MyApp */,
-				12B53BF5308EE11F005E197E /* ml */,
 			);
 			name = MyApp;
 			productName = MyApp;
